@@ -10,6 +10,7 @@ import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.queryparser.classic.ParseException;
 import org.apache.lucene.queryparser.classic.QueryParser;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
@@ -24,6 +25,7 @@ import java.io.*;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 class Line {
@@ -56,8 +58,12 @@ public class IRSystem {
         srcFilePath = srcPath;
     }
 
+    private Directory getDirectory() throws IOException {
+        return MMapDirectory.open(Paths.get(directoryPath));
+    }
+
     public void createIndex() throws Exception {
-        Directory directory = MMapDirectory.open(Paths.get(directoryPath));
+        Directory directory = getDirectory();
         IndexWriterConfig indexWriterConfig = new IndexWriterConfig(analyzer);
         indexWriterConfig.setSimilarity(similarity);
         indexWriterConfig.setOpenMode(IndexWriterConfig.OpenMode.CREATE);
@@ -76,6 +82,7 @@ public class IRSystem {
         System.out.println("A total of " + numDocs + " objects are indexed.");
         indexWriter.close();
     }
+
 
     private List<Line> readLines(String filename) throws Exception {
         FileInputStream inputStream = new FileInputStream(filename);
@@ -99,35 +106,72 @@ public class IRSystem {
         out.close();
     }
 
-    public void searchParallel(String queryFile, String OutputFile, int nBest) throws Exception {
-        Directory directory = MMapDirectory.open(Paths.get(directoryPath));
+    public void searchParallel(String queryFile, String outputFile, int nBest, int chunkSize) throws Exception {
+        Directory directory = getDirectory();
         IndexReader indexReader = DirectoryReader.open(directory);
         IndexSearcher indexSearcher = new IndexSearcher(indexReader);
         indexSearcher.setSimilarity(similarity);
         List<Line> lines = readLines(queryFile);
-        List<Result> results = lines.parallelStream().map((Line s) -> {
-            Result result;
-            try {
-                result = search(s.getLineno(), s.getLine(), nBest, indexSearcher);
-            } catch (Exception e) {
-                e.printStackTrace();
-                result = new Result(s.getLineno());
-            }
-            return result;
-        }).collect(Collectors.toList());
-        writeJSON(results, OutputFile);
+        final AtomicInteger counter = new AtomicInteger();
+        for (int i = 0; i < lines.size(); i += chunkSize) {
+            String chunkOutputFile = outputFile + ".chunk_" + i;
+            searchOneChunk(lines.subList(i, i + chunkSize), chunkOutputFile, nBest, indexSearcher, counter, lines.size());
+        }
         indexReader.close();
     }
 
-    private Result search(int lineno, String line, int nBest, IndexSearcher searcher) throws Exception {
+    public void searchParallel(String queryFile, String outputFile, int nBest) throws Exception {
+        Directory directory = getDirectory();
+        IndexReader indexReader = DirectoryReader.open(directory);
+        IndexSearcher indexSearcher = new IndexSearcher(indexReader);
+        indexSearcher.setSimilarity(similarity);
+        List<Line> lines = readLines(queryFile);
+        final AtomicInteger counter = new AtomicInteger();
+        searchOneChunk(lines, outputFile, nBest, indexSearcher, counter, lines.size());
+        indexReader.close();
+    }
+
+    private void searchOneChunk(List<Line> lines, String outputFile, int nBest, IndexSearcher indexSearcher, final AtomicInteger counter, int elementsCount) throws Exception {
+        int fivePercent = elementsCount / 20;
+        List<Result> results = lines.parallelStream().map((Line s) -> {
+            return search(s.getLineno(), s.getLine(), nBest, indexSearcher);
+        }).peek(stat -> {
+            if (counter.incrementAndGet() % fivePercent == 0) {
+                String info = "[" + (5 * (counter.get() / fivePercent)) + "%] " + counter.get() + " elements on " + elementsCount + " treated.";
+                System.out.println(info);
+            }
+        }).collect(Collectors.toList());
+        writeJSON(results, outputFile);
+    }
+
+    private Result search(int lineno, String line, int nBest, IndexSearcher searcher) {
         QueryParser parser = new QueryParser("text", analyzer);
         String str = QueryParser.escape(line);
-        Query query = parser.parse(str);
-        TopDocs topDocs = searcher.search(query, nBest);
-        ScoreDoc[] scoreDocs = topDocs.scoreDocs;
+        Query query = null;
         Result result = new Result(lineno);
+        try {
+            query = parser.parse(str);
+        } catch (ParseException e) {
+            e.printStackTrace();
+            return result;
+        }
+        TopDocs topDocs = null;
+        try {
+            topDocs = searcher.search(query, nBest);
+        } catch (IOException e) {
+            e.printStackTrace();
+            return result;
+        }
+        ScoreDoc[] scoreDocs = topDocs.scoreDocs;
+
         for (ScoreDoc s : scoreDocs) {
-            Document doc = searcher.doc(s.doc);
+            Document doc = null;
+            try {
+                doc = searcher.doc(s.doc);
+            } catch (IOException e) {
+                e.printStackTrace();
+                return result;
+            }
             String text = doc.get("text");
             float score = s.score;
             result.addItem(text, score);
@@ -135,8 +179,12 @@ public class IRSystem {
         return result;
     }
 
-    public void searchSerial(String queryFile, String OutputFile, int nBest) throws Exception {
-        Directory directory = MMapDirectory.open(Paths.get(directoryPath));
+    public void searchSerial(String queryFile, String outputFile, int nBest) throws Exception {
+        searchSerial(queryFile, outputFile, nBest, 100000);
+    }
+
+    public void searchSerial(String queryFile, String outputFile, int nBest, int logSteps) throws Exception {
+        Directory directory = getDirectory();
         IndexReader indexReader = DirectoryReader.open(directory);
         IndexSearcher indexSearcher = new IndexSearcher(indexReader);
         indexSearcher.setSimilarity(similarity);
@@ -148,12 +196,12 @@ public class IRSystem {
         while ((str = bufferedReader.readLine()) != null) {
             Result result = search(lineno, str, nBest, indexSearcher);
             results.add(result);
-            if ((lineno + 1) % 100000 == 0) {
+            if ((lineno + 1) % logSteps == 0) {
                 System.out.println((lineno + 1) + " records have been processed");
             }
             lineno = lineno + 1;
         }
-        writeJSON(results, OutputFile);
+        writeJSON(results, outputFile);
         indexReader.close();
         inputStream.close();
         bufferedReader.close();
